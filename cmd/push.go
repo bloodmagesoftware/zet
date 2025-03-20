@@ -26,7 +26,7 @@ var pushCmd = &cobra.Command{
 		defer r.Close()
 
 		if empty, err := r.IsEmpty(); err != nil {
-			return errors.Join(errors.New("failed to check if remote dir is empty"), err)
+			return errors.Join(errors.New("failed to check if remote directory is empty"), err)
 		} else if empty {
 			if err := r.InitialCommit(); err != nil {
 				return errors.Join(errors.New("failed to push initial commit"), err)
@@ -35,7 +35,7 @@ var pushCmd = &cobra.Command{
 			}
 		} else {
 			if err := r.CommitInteractive(); err != nil {
-				return errors.Join(errors.New("failed to push commit"), err)
+				return errors.Join(errors.New("failed to push to remote"), err)
 			} else {
 				return nil
 			}
