@@ -1,0 +1,83 @@
+# yaml-language-server: https://raw.githubusercontent.com/SchemaStore/schemastore/master/src/schemas/json/github-workflow.json
+---
+name: goreleaser
+
+on:
+  create:
+    tags:
+      - "**"
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  test-mac:
+    runs-on: macos-latest
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          architecture: x64
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./... -v
+  test-win:
+    runs-on: windows-latest
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          architecture: x64
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./... -v
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+          architecture: x64
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build
+        run: go build ./...
+      - name: Test
+        run: go test ./... -v
+
+  goreleaser:
+    needs:
+      - test-linux
+      - test-mac
+      - test-win
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
