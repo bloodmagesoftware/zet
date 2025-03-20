@@ -46,6 +46,10 @@ func (p System) Open() (*os.File, error) {
 	return os.Open(string(p))
 }
 
+func (p System) Stat() (os.FileInfo, error) {
+	return os.Stat(string(p))
+}
+
 func WalkDir(root System, fn func(sysPath System, d fs.DirEntry, err error) error) error {
 	return filepath.WalkDir(string(root), func(path string, d fs.DirEntry, err error) error {
 		return fn(System(path), d, err)

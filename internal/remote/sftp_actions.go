@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,22 +13,33 @@ import (
 	"path"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/bloodmagesoftware/zet/internal/ignore"
 	"github.com/bloodmagesoftware/zet/internal/options"
 	"github.com/bloodmagesoftware/zet/internal/paths"
+	"github.com/bloodmagesoftware/zet/internal/user"
+	"github.com/charmbracelet/huh"
 )
 
 const (
 	DirContent = "content"
-	DirHash    = "hash"
-	FileIgnore = "ignore_file"
+	DirMeta    = "meta"
+	FileIgnore = "ignore"
 )
+
+type Meta struct {
+	Hash       []byte    `json:"hash"`
+	LastEditor string    `json:"last_editor"`
+	LastEdit   time.Time `json:"last_edit"`
+}
 
 type (
 	commitFile struct {
-		Path   paths.Path
-		Status commitFileStatus
+		Path       paths.Path
+		Status     commitFileStatus
+		LastEditor string
+		LastEdit   time.Time
 	}
 	commitFileStatus uint8
 )
@@ -41,11 +53,11 @@ const (
 func (cfs commitFileStatus) ToString() string {
 	switch cfs {
 	case commitFileStatusCreate:
-		return "+"
+		return "ADD   "
 	case commitFileStatusDelete:
-		return "-"
+		return "DELETE"
 	case commitFileStatusChange:
-		return "~"
+		return "CHANGE"
 	default:
 		return "?"
 	}
@@ -62,10 +74,10 @@ func (r *Remote) IsEmpty() (bool, error) {
 
 func (r *Remote) InitialCommit() error {
 	if options.FlagVerbose {
-		fmt.Println("Initial commit")
+		fmt.Println("initial commit")
 	}
 
-	if err := r.PushIgnore(); err != nil {
+	if err := r.pushIgnore(); err != nil {
 		return errors.Join(errors.New("failed to push ignore"), err)
 	}
 
@@ -91,7 +103,7 @@ func (r *Remote) InitialCommit() error {
 			return nil
 		}
 
-		if err := r.PushFile(sysPath); err != nil {
+		if err := r.pushFile(sysPath); err != nil {
 			return errors.Join(fmt.Errorf("failed to push file %s to remote", sysPath), err)
 		}
 
@@ -104,7 +116,7 @@ func (r *Remote) InitialCommit() error {
 }
 
 func (r *Remote) CommitInteractive() error {
-	if err := r.PushIgnore(); err != nil {
+	if err := r.pushIgnore(); err != nil {
 		return errors.Join(errors.New("failed to push ignore"), err)
 	}
 
@@ -113,8 +125,48 @@ func (r *Remote) CommitInteractive() error {
 		return errors.Join(errors.New("failed to get local changes"), err)
 	}
 
-	for _, cf := range commitables {
-		fmt.Printf("%s %s\n", cf.Status.ToString(), cf.Path)
+	opts := make([]huh.Option[*commitFile], len(commitables))
+
+	for i, cf := range commitables {
+		if cf.Status == commitFileStatusCreate {
+			opts[i] = huh.Option[*commitFile]{
+				Key:   fmt.Sprintf("%s %s", cf.Status.ToString(), cf.Path.ToString()),
+				Value: &cf,
+			}
+		} else {
+			opts[i] = huh.Option[*commitFile]{
+				Key:   fmt.Sprintf("%s %s previously changed at %s by %s", cf.Status.ToString(), cf.Path.ToString(), cf.LastEdit.Format(time.UnixDate), cf.LastEditor),
+				Value: &cf,
+			}
+		}
+	}
+
+	var selectedCommitables []*commitFile
+
+	if err := huh.NewForm(huh.NewGroup(
+		huh.NewMultiSelect[*commitFile]().
+			Title("Diff from current remote").
+			Options(opts...).
+			Value(&selectedCommitables),
+	)).Run(); err != nil {
+		return err
+	}
+
+	for _, cf := range selectedCommitables {
+		switch cf.Status {
+		case commitFileStatusCreate:
+			if err := r.pushFile(cf.Path.(paths.System)); err != nil {
+				return errors.Join(fmt.Errorf("failed to create %s", cf.Path.ToString()), err)
+			}
+		case commitFileStatusDelete:
+			if err := r.removeFile(cf.Path); err != nil {
+				return errors.Join(fmt.Errorf("failed to delete %s", cf.Path.ToString()), err)
+			}
+		case commitFileStatusChange:
+			if err := r.pushFile(cf.Path.(paths.System)); err != nil {
+				return errors.Join(fmt.Errorf("failed to change %s", cf.Path.ToString()), err)
+			}
+		}
 	}
 
 	return nil
@@ -122,6 +174,7 @@ func (r *Remote) CommitInteractive() error {
 
 func (r *Remote) getCommitable() ([]commitFile, error) {
 	ignoreMatcher := ignore.GetMatcher(r.Config)
+	now := time.Now()
 
 	var (
 		commitables   []commitFile
@@ -159,26 +212,30 @@ func (r *Remote) getCommitable() ([]commitFile, error) {
 			return errors.Join(fmt.Errorf("failed to check if file %s exists on remote", sysPath), err)
 		} else if !exists {
 			commitables = append(commitables, commitFile{
-				Path:   sysPath,
-				Status: commitFileStatusCreate,
+				sysPath,
+				commitFileStatusCreate,
+				"",
+				now,
 			})
 			return nil
 		}
 
-		rh, err := r.getRemoteHash(unixPath)
+		rm, err := r.getRemoteMeta(unixPath)
 		if err != nil {
-			return errors.Join(fmt.Errorf("failed to get remote hash from %s", unixPath), err)
+			return errors.Join(fmt.Errorf("failed to get remote meta from %s", unixPath), err)
 		}
 		lh, err := sysPath.Hash()
 		if err != nil {
 			return errors.Join(fmt.Errorf("failed to get hash from %s", sysPath), err)
 		}
-		if bytes.Equal(rh, lh) {
+		if bytes.Equal(rm.Hash, lh) {
 			return nil
 		}
 		commitables = append(commitables, commitFile{
-			Path:   sysPath,
-			Status: commitFileStatusChange,
+			sysPath,
+			commitFileStatusChange,
+			rm.LastEditor,
+			rm.LastEdit,
 		})
 
 		return nil
@@ -190,7 +247,7 @@ func (r *Remote) getCommitable() ([]commitFile, error) {
 		fmt.Println("checking remote files for deletes")
 	}
 
-	remoteWalkRoot := path.Join(r.Config.Remote.Path, DirHash)
+	remoteWalkRoot := path.Join(r.Config.Remote.Path, DirMeta)
 	remoteWalker := r.SftpClient.Walk(remoteWalkRoot)
 	for remoteWalker.Step() {
 		unixPath, err := paths.Unix(remoteWalker.Path()).Rel(remoteWalkRoot)
@@ -211,10 +268,22 @@ func (r *Remote) getCommitable() ([]commitFile, error) {
 			continue
 		}
 
+		rf, err := r.SftpClient.Open(remoteWalker.Path())
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("failed to open remote file %s", remoteWalker.Path()), err)
+		}
+		defer rf.Close()
+		rm := Meta{}
+		if json.NewDecoder(rf).Decode(&rm); err != nil {
+			return nil, errors.Join(fmt.Errorf("failed to get remote meta from %s", unixPath), err)
+		}
+
 		if slices.Index(existingFiles, unixPath) == -1 {
 			commitables = append(commitables, commitFile{
-				Path:   unixPath,
-				Status: commitFileStatusDelete,
+				unixPath,
+				commitFileStatusDelete,
+				rm.LastEditor,
+				rm.LastEdit,
 			})
 		}
 	}
@@ -222,9 +291,9 @@ func (r *Remote) getCommitable() ([]commitFile, error) {
 	return commitables, nil
 }
 
-func (r *Remote) PushIgnore() error {
+func (r *Remote) pushIgnore() error {
 	if options.FlagVerbose {
-		fmt.Print("Pushing ignore... ")
+		fmt.Print("pushing ignore... ")
 		defer fmt.Println()
 	}
 
@@ -250,7 +319,7 @@ func (r *Remote) existsOnRemote(name paths.Path) (bool, error) {
 	unixNameStr := name.ToUnix().ToString()
 
 	remoteName := path.Join(r.Config.Remote.Path, DirContent, unixNameStr+".gz")
-	remoteHashName := path.Join(r.Config.Remote.Path, DirHash, unixNameStr)
+	remoteMetaName := path.Join(r.Config.Remote.Path, DirMeta, unixNameStr)
 
 	if _, err := r.SftpClient.Stat(remoteName); err != nil {
 		if os.IsNotExist(err) {
@@ -260,7 +329,7 @@ func (r *Remote) existsOnRemote(name paths.Path) (bool, error) {
 		}
 	}
 
-	if _, err := r.SftpClient.Stat(remoteHashName); err != nil {
+	if _, err := r.SftpClient.Stat(remoteMetaName); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		} else {
@@ -271,46 +340,70 @@ func (r *Remote) existsOnRemote(name paths.Path) (bool, error) {
 	return true, nil
 }
 
-func (r *Remote) getRemoteHash(name paths.Path) ([]byte, error) {
-	remoteHashName := path.Join(r.Config.Remote.Path, DirHash, name.ToUnix().ToString())
-	f, err := r.SftpClient.Open(remoteHashName)
+func (r *Remote) getRemoteMeta(name paths.Path) (Meta, error) {
+	m := Meta{}
+	remoteMetaName := path.Join(r.Config.Remote.Path, DirMeta, name.ToUnix().ToString())
+	f, err := r.SftpClient.Open(remoteMetaName)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to open remote file %s", remoteHashName), err)
+		return m, errors.Join(fmt.Errorf("failed to open remote file %s", remoteMetaName), err)
 	}
 	defer f.Close()
 
-	h, err := io.ReadAll(f)
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("failed to read remote file %s", remoteHashName), err)
+	if err := json.NewDecoder(f).Decode(&m); err != nil {
+		return m, errors.Join(fmt.Errorf("failed to read remote file %s", remoteMetaName), err)
 	}
 
-	return h, nil
+	return m, nil
 }
 
-func (r *Remote) PushFile(sysPath paths.System) error {
+func (r *Remote) removeFile(pat paths.Path) error {
 	if options.FlagVerbose {
-		fmt.Printf("pushing %s... ", sysPath)
+		fmt.Printf("removing %s... ", pat)
 		defer fmt.Println()
 	}
 
-	unixName := sysPath.ToUnix()
+	unixName := pat.ToUnix()
+	remoteName := path.Join(r.Config.Remote.Path, DirContent, string(unixName)+".gz")
+	remoteMetaName := path.Join(r.Config.Remote.Path, DirMeta, string(unixName))
+
+	if err := r.SftpClient.Remove(remoteMetaName); err != nil {
+		return errors.Join(fmt.Errorf("failed to remove file %s", remoteMetaName), err)
+	}
+	if err := r.SftpClient.Remove(remoteName); err != nil {
+		return errors.Join(fmt.Errorf("failed to remove file %s", remoteName), err)
+	}
+	return nil
+}
+
+func (r *Remote) pushFile(pat paths.System) error {
+	if options.FlagVerbose {
+		fmt.Printf("pushing %s... ", pat)
+		defer fmt.Println()
+	}
+
+	unixName := pat.ToUnix()
 
 	remoteDir := path.Join(r.Config.Remote.Path, DirContent, path.Dir(string(unixName)))
-	remoteHashDir := path.Join(r.Config.Remote.Path, DirHash, path.Dir(string(unixName)))
+	remoteMetaDir := path.Join(r.Config.Remote.Path, DirMeta, path.Dir(string(unixName)))
 	remoteName := path.Join(r.Config.Remote.Path, DirContent, string(unixName)+".gz")
-	remoteHashName := path.Join(r.Config.Remote.Path, DirHash, string(unixName))
+	remoteMetaName := path.Join(r.Config.Remote.Path, DirMeta, string(unixName))
 
-	f, err := sysPath.Open()
+	stat, err := pat.Stat()
 	if err != nil {
-		return errors.Join(fmt.Errorf("failed to open local file %s", sysPath), err)
+		return errors.Join(fmt.Errorf("failed to stat file %s", pat), err)
+	}
+
+	f, err := pat.Open()
+	if err != nil {
+		return errors.Join(fmt.Errorf("failed to open local file %s", pat), err)
 	}
 	defer f.Close()
 
 	if err := r.SftpClient.MkdirAll(remoteDir); err != nil && !os.IsExist(err) {
 		return errors.Join(fmt.Errorf("failed to make directory %s on remote", remoteDir))
 	}
-	if err := r.SftpClient.MkdirAll(remoteHashDir); err != nil && !os.IsExist(err) {
-		return errors.Join(fmt.Errorf("failed to make directory %s on remote", remoteHashDir))
+	if err := r.SftpClient.MkdirAll(remoteMetaDir); err != nil && !os.IsExist(err) {
+		return errors.Join(fmt.Errorf("failed to make directory %s on remote", remoteMetaDir))
 	}
 
 	rf, err := r.SftpClient.Create(remoteName)
@@ -330,7 +423,7 @@ func (r *Remote) PushFile(sysPath paths.System) error {
 	mw := io.MultiWriter(h, gw)
 
 	if _, err := io.Copy(mw, f); err != nil {
-		return errors.Join(fmt.Errorf("failed to copy file %s to remote", sysPath), err)
+		return errors.Join(fmt.Errorf("failed to copy file %s to remote", pat), err)
 	}
 
 	// Close the gzip writer explicitly to ensure all data is flushed
@@ -340,14 +433,19 @@ func (r *Remote) PushFile(sysPath paths.System) error {
 
 	hashVal := h.Sum(nil)
 
-	hashFile, err := r.SftpClient.Create(remoteHashName)
+	metaFile, err := r.SftpClient.Create(remoteMetaName)
 	if err != nil {
-		return errors.Join(fmt.Errorf("failed to create hash file %s on remote", remoteHashName), err)
+		return errors.Join(fmt.Errorf("failed to create meta file %s on remote", remoteMetaName), err)
 	}
-	defer hashFile.Close()
+	defer metaFile.Close()
 
-	if _, err := hashFile.Write(hashVal); err != nil {
-		return errors.Join(fmt.Errorf("failed to write hash to file %s on remote", remoteHashName), err)
+	m := Meta{
+		hashVal,
+		user.Name(),
+		stat.ModTime(),
+	}
+	if err := json.NewEncoder(metaFile).Encode(&m); err != nil {
+		return errors.Join(fmt.Errorf("failed to write meta to file %s on remote", remoteMetaName), err)
 	}
 
 	if options.FlagVerbose {
